@@ -8,6 +8,7 @@
 #
 # --------------------------------------------------------------------
 set -o nounset
+set -o errexit
 
 SCRIPTNAME=${0##*/}
 USAGE="USAGE
@@ -33,7 +34,7 @@ OPTIONS
     -V      Prints version of the script
 
     -d num  Do not renew the cert if it exists and will be valid
-            for next 'num' days (default 14)
+            for next 'num' days (default 30)
     -f      Force renew the certificate
     -q      Quiet mode, suitable for cron (overrides '-v')
     -v      Verbose mode, useful for testing (overrides '-q')
@@ -41,7 +42,7 @@ OPTIONS
             certificate, but useful for testing"
 
 # script version: major.minor(.patch)
-VERSION='0.2.1'
+VERSION='0.4.1'
 
 # --------------------------------------------------------------------
 # -- Functions -------------------------------------------------------
@@ -62,7 +63,9 @@ warning() {
 }
 
 information() {
-    [ "$VERBOSE" == 'true' ] && message "info" "$*"
+    if [ "$VERBOSE" == 'true' ]; then
+        message "info" "$*"
+    fi
 }
 
 # is $1 a readable ordinary file?
@@ -107,7 +110,7 @@ stop_nginx() {
       zmmailboxdctl stop > /dev/null || {
         error "There were some error during stopping the Zimbra' nginx."
         fix_nginx_message
-        exit 3
+        return 3
     }
 }
 
@@ -119,9 +122,27 @@ start_nginx() {
       zmmailboxdctl start > /dev/null || {
         error "There were some error during starting the Zimbra' nginx."
         fix_nginx_message
-        exit 3
+        return 3
     }
 }
+
+# Restart all zimbra services (run in subshell due to env variables)
+restart_zimbra() (
+    information "restart zimbra"
+
+    # set env for perl (for zmwatch)
+    if declare -v PERLLIB &> /dev/null; then
+        PERLLIB="${zimbra_perllib}:${PERLLIB}"
+    else
+        PERLLIB="${zimbra_perllib}"
+    fi
+    export PERLLIB
+
+    zmcontrol restart > /dev/null || {
+        error "Restarting zimbra failed."
+        return 5
+    }
+)
 
 # this function will constructs openssl csr config to stdout
 # arguments are used as SAN
@@ -147,8 +168,17 @@ source "$letsencrypt_zimbra_config" || {
     exit 1
 }
 
-# a lot of binaries in zimbra_bin_dir
-PATH="$zimbra_bin_dir:$PATH"
+# a lot of binaries in zimbra bin dir
+PATH="${zimbra_dir}/bin:$PATH"
+
+perl_archname=$(perl -MConfig -e 'print $Config{archname}')
+zimbra_perllib="${zimbra_dir}/common/lib/perl5/${perl_archname}:${zimbra_dir}/common/lib/perl5"
+
+
+# Use default values if not set in config file
+zimbra_ssl_dir="${zimbra_ssl_dir:-${zimbra_dir}/ssl/zimbra/commercial}"
+zimbra_key="${zimbra_key:-${zimbra_ssl_dir}/commercial.key}"
+zimbra_cert="${zimbra_cert:-${zimbra_ssl_dir}/commercial.crt}"
 
 
 # openssl config skeleton
@@ -177,7 +207,7 @@ certbot_extra_args=("--non-interactive" "--agree-tos")
 TESTING='false'
 VERBOSE='false'
 FORCE='false'
-DAYS='14'
+DAYS='30'
 
 # --------------------------------------------------------------------
 # -- Usage -----------------------------------------------------------
@@ -349,22 +379,26 @@ openssl req -new -nodes -sha256 -outform der \
 stop_nginx
 
 # ----------------------------------------------------------
-# letsencrypt utility stores the obtained certificates in PWD
-# so we must cd in the temp directory
-cd "$temp_dir"
-
 information "issue certificate; certbot_extra_args: ${certbot_extra_args[@]}"
-sudo "$letsencrypt" certonly \
-  --standalone \
-  "${certbot_extra_args[@]}" \
-  --email "$email" --csr "$request_file" || {
-    error "The certificate cannot be obtained with '$letsencrypt' tool."
-    start_nginx
-    exit 4
-}
+(
+    # run in subshell due to working directory and umask change
 
-# cd back -- which is not really neccessarry
-cd - > /dev/null
+    # letsencrypt utility stores the obtained certificates in PWD
+    # so we must cd in the temp directory
+    cd "$temp_dir"
+    # ensure generated certificate would be readable for zimbra user
+    umask 0022
+
+    sudo "$letsencrypt" certonly \
+      --standalone \
+      "${certbot_extra_args[@]}" \
+      --email "$email" --csr "$request_file" || {
+        error "The certificate cannot be obtained with '$letsencrypt' tool."
+        start_nginx
+        exit 4
+    }
+
+)
 # ----------------------------------------------------------
 
 # start Zimbra' nginx again
@@ -413,11 +447,7 @@ zmcertmgr deploycrt comm "$cert_file" "$chain_file" > /dev/null || {
 
 
 # finally, restart the Zimbra
-information "restart zimbra"
-zmcontrol restart > /dev/null || {
-    error "Restarting zimbra failed."
-    exit 5
-}
+restart_zimbra
 
 
 # --------------------------------------------------------------------
